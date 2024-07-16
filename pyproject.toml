@@ -1,0 +1,17 @@
+[project]
+name = "pyoas"
+version = "0.1.0"
+description = "Python tools for the Observed Antibody Space"
+readme = "README.md"
+requires-python = ">=3.7"
+license = {file = "LICENSE.txt"}
+
+authors = [
+  {name = "Feiyang Huang"}
+]
+
+dependencies = [
+    "numpy",
+    "pandas",
+    "torch",
+]
