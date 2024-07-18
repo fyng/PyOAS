@@ -1,201 +1,217 @@
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
 from pathlib import Path
+import pickle
 import json
 import ast
 import re
-import pandas as pd
-import torch
-import numpy as np
-from pathlib import Path
 from tqdm import tqdm
 
-class OASData():
-    def __init__(self):
-        self.df = None
-        self.annot_map = {
-            'fwk1': '1',
-            'cdrk1': '2',
-            'fwk2': '3',
-            'cdrk2': '4',
-            'fwk3': '5',
-            'cdrk3': '6',
-            'fwk4': '7',
-            'fwl1': '1',
-            'cdrl1': '2',
-            'fwl2': '3',
-            'cdrl2': '4',
-            'fwl3': '5',
-            'cdrl3': '6',
-            'fwl4': '7',
-            'fwh1': '1',
-            'cdrh1': '2',
-            'fwh2': '3',
-            'cdrh2': '4',
-            'fwh3': '5',
-            'cdrh3': '6',
-            'fwh4': '7',
-        }
+import pandas as pd
+import numpy as np
+import torch
 
-    def load_data_from_files(self, data_path = None):
-        sequences = []
-        metadata = {}
-
-        meta_idx = 0
-        data_path = Path(data_path)
-        files = list(data_path.glob('*.csv.gz'))
-        for filename in tqdm(files):
-            metadata[meta_idx] = json.loads(','.join(pd.read_csv(filename, nrows=0).columns))
-            seq = pd.read_csv(filename, header=1)
-            seq['meta_idx'] = meta_idx
-            sequences.append(seq)
-            meta_idx += 1
-        self.df = pd.concat(sequences, ignore_index=True)
+from pyoas.utils import vocab
 
 
-    def _row_anarci_aa_seq_label(self, row):
-        anarci_dict_light = ast.literal_eval(row['ANARCI_numbering_light'])
-        label_heavy = []
-        seq_heavy = []
-        pos_heavy = []
-        anarci_dict_heavy = ast.literal_eval(row['ANARCI_numbering_heavy'])
-        label_light = []
-        seq_light = []
-        pos_light = []
-        offset_light = 0
-        offset_heavy = 0
+@dataclass
+class Antibody():
+    sequence: list[str] = None
+    vdj_label: list[str] = None
+    anarci_label: list[str] = None
+    position: list[int] = None
+    metadata: dict = None
 
-        for region, dict in anarci_dict_light.items():
-            for pos, aa in dict.items():
-                seq_light.append(aa)
-                label_light.append(self.annot_map[region])
-                pos, offset = self._process_anarci_pos(pos)
-                offset_light += offset
-                pos_light.append(pos + offset_light - 1)
-        for region, dict in anarci_dict_heavy.items():
-            for pos, aa in dict.items():
-                seq_heavy.append(aa)
-                label_heavy.append(self.annot_map[region])
-                pos, offset = self._process_anarci_pos(pos)
-                offset_heavy += offset
-                pos_heavy.append(pos + offset_heavy - 1)
-                
-        return label_heavy, seq_heavy, pos_heavy, label_light, seq_light, pos_light
+    def __str__(self) -> str:
+        return(f"{''.join(self.sequence)}\n{''.join(self.vdj_label)}\n{''.join(self.anarci_label)}\n{self.position}\n{self.metadata}")
+
+@dataclass
+class AntibodyTensor():
+    sequence: torch.Tensor = None
+    vdj_label: torch.Tensor = None
+    anarci_label: torch.Tensor = None
+    position: torch.Tensor = None
+    metadata: dict = None    
     
 
+class DataModule(ABC):
+    @abstractmethod
+    def load_data_folder(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def to_array(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def to_dataframe(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def load_saved(self):
+        raise NotImplementedError
+
+class OASDataModule(DataModule):
+    pass
+
+
+class OTSDataModule(DataModule):
+    '''
+    Data module for (Observed TCR Space)[https://opig.stats.ox.ac.uk/webapps/ots]
+    '''
+    def __init__(self) -> None:
+        self.df = None
+        self.metadata_dict = {}
+        self.data = None
+
     def _process_anarci_pos(self, pos):
-        if re.search(r'[a-zA-Z]$', pos):
-            return int(pos[:-1]), 1
+        # FIXME: is this really correct? right now we shift the alignment upon insertion, but we want to preserve the alignment
+        match = re.match(r'(\d+)([A-Za-z].*)?', pos)
+        if match:
+            return int(match.group(1)), 1
         else:
             return int(pos), 0
 
+    def _parse_anarci_dict(self, x):
+        dict = ast.literal_eval(x) if isinstance(x, str) else x
 
-    def get_vdj_label_aa_sequence_match(self, row):
-        # TODO: this whole dictionary thing is disgusting. Make a tokenizer class to handle the functional annotations, and probably store an array instead of a string
-        alignment_aa_heavy = row['sequence_alignment_aa_heavy']
-        label_heavy = ['-'] * len(alignment_aa_heavy)
+        label = []
+        sequence = []
+        position = []
+        pos_offset = 0
+
+        for region, dict in dict.items():
+            for pos, aa in dict.items():
+                sequence.append(aa)
+                label.append(region)
+                pos, offset = self._process_anarci_pos(pos)
+                pos_offset += offset
+                position.append(pos + pos_offset - 1)
+
+        return sequence, label, position
+    
+    def _parse_vdj_label(self, seq, v, d, j):
+        label = [vocab.UNK_STR] * len(seq)
         idx = 0
-
-        if not pd.isna(row['v_sequence_alignment_aa_heavy']):
-            match = re.search(row['v_sequence_alignment_aa_heavy'], alignment_aa_heavy)
+        if v:
+            match = re.search(v, seq)
             if match:
                 start, end = match.span()
                 idx = end
-                label_heavy[start:end] = 'V' * (end - start)
-        if not pd.isna(row['d_sequence_alignment_aa_heavy']):
-            match = re.search(row['d_sequence_alignment_aa_heavy'], alignment_aa_heavy[idx:])
+                label[start:end] = 'V' * (end - start)
+        if d:
+            match = re.search(d, seq)
             if match:
                 start, end = match.span()
                 start += idx
                 end += idx
-                label_heavy[start:end] = 'D' * (end - start)
+                label[start:end] = 'D' * (end - start)
                 idx = end
-        if not pd.isna(row['j_sequence_alignment_aa_heavy']):
-            match = re.search(row['j_sequence_alignment_aa_heavy'], alignment_aa_heavy[idx:])
+        if j:
+            match = re.search(j, seq)
             if match:
                 start, end = match.span()
                 start += idx
                 end += idx
-                label_heavy[start:end] = 'J' * (end - start)
-            label_heavy = ''.join(label_heavy)
-
-        alignment_aa_light = row['sequence_alignment_aa_light']
-        label_light = ['-'] * len(alignment_aa_light)
-        idx = 0
-
-        if not pd.isna(row['v_sequence_alignment_aa_light']):
-            match = re.search(row['v_sequence_alignment_aa_light'], alignment_aa_light)
-            if match:
-                start, end = match.span()
-                idx = end
-                label_light[start:end] = 'V' * (end - start)
-        if not pd.isna(row['d_sequence_alignment_aa_light']):
-            match = re.search(row['d_sequence_alignment_aa_light'], alignment_aa_light[idx:])
-            if match:
-                start, end = match.span()
-                start += idx
-                end += idx
-                label_light[start:end] = 'D' * (end - start)
-                idx = end
-        if not pd.isna(row['j_sequence_alignment_aa_light']):  
-            match = re.search(row['j_sequence_alignment_aa_light'], alignment_aa_light[idx:])
-            if match:
-                start, end = match.span()
-                start += idx
-                end += idx
-                label_light[start:end] = 'J' * (end - start)
-        label_light = ''.join(label_light)
-
-        return label_heavy, label_light
-
-
-    def df_row_to_array_aligned(self, row, to_tensor=False, aligned=True):
-        label_vdj_heavy, label_vdj_light = self.get_vdj_label_aa_sequence_match(row) # arrays
-        label_anarci_heavy, seq_heavy, pos_heavy, label_anarci_light, seq_light, pos_light = self._row_anarci_aa_seq_label(row)
-
-        # # protein sequence must match between ANARCI dict entry and recorded entry
-        # assert(''.join(seq_heavy) == row['sequence_alignment_aa_heavy'])
-        # assert(''.join(seq_light) == row['sequence_alignment_aa_light'])
-
-        # map to standardized position
-        # assume that IMGT Ab has max 128 positions 
-        # https://github.com/oxpig/ANARCI
-        seq_data_heavy = np.full((3,168), '.', ) # '.' token for gaps
-        seq_data_light = np.full((3,168), '.') # '.' token for gaps
-
-        if aligned:
-            seq_data_heavy[0, pos_heavy] = seq_heavy
-            seq_data_heavy[1, pos_heavy] = label_anarci_heavy
-            seq_data_heavy[2, pos_heavy] = label_vdj_heavy
-            
-            seq_data_light[0, pos_light] = seq_light
-            seq_data_light[1, pos_light] = label_anarci_light
-            seq_data_light[2, pos_light] = label_vdj_light
-        else:
-            # TODO: postpend a SEP token
-
-            seq_data_heavy[0, len(seq_heavy)] = seq_heavy 
-            seq_data_heavy[1, len(label_anarci_heavy)] = label_anarci_heavy
-            seq_data_heavy[2, len(label_vdj_heavy)] = label_vdj_heavy
-            
-            seq_data_light = np.full((3,168), '.') # '.' token for gaps
-            seq_data_light[0, len(seq_light)] = seq_light
-            seq_data_light[1, len(label_anarci_light)] = label_anarci_light
-            seq_data_light[2, len(label_vdj_light)] = label_vdj_light
-
-        if to_tensor:
-            seq_data_heavy = torch.tensor(seq_data_heavy)
-            seq_data_light = torch.tensor(seq_data_light)
+                label[start:end] = 'J' * (end - start)
         
-        return seq_data_heavy, seq_data_light
+        return label
+
+    def parse_data(self):
+        if self.df is None:
+            raise ValueError('No data loaded')
+
+        columns_to_convert = [
+            'ANARCI_numbering_alpha',
+            'ANARCI_numbering_beta',
+            'v_sequence_alignment_aa_alpha',
+            'j_sequence_alignment_aa_alpha',
+            'd_sequence_alignment_aa_alpha',
+            'v_sequence_alignment_aa_beta',
+            'j_sequence_alignment_aa_beta',
+            'd_sequence_alignment_aa_beta'
+        ]
+        # TODO: discard NAs in key columns
+        self.df[columns_to_convert] = self.df[columns_to_convert].astype(str)
+
+        anarci_dict_a = self.df['ANARCI_numbering_alpha'].to_list()
+        anarci_dict_b = self.df['ANARCI_numbering_beta'].to_list()
+        v_a = self.df['v_sequence_alignment_aa_alpha'].to_list()
+        j_a = self.df['j_sequence_alignment_aa_alpha'].to_list()
+        d_a = self.df['d_sequence_alignment_aa_alpha'].to_list()
+        v_b = self.df['v_sequence_alignment_aa_beta'].to_list()
+        j_b = self.df['j_sequence_alignment_aa_beta'].to_list()
+        d_b = self.df['d_sequence_alignment_aa_beta'].to_list()
+        meta_idx = self.df['metadata_idx'].to_list()
+
+        data = []
+        for i, (aa, ab, va, ja, da, vb, jb, db) in enumerate(tqdm(
+            zip(anarci_dict_a, anarci_dict_b, v_a, j_a, d_a, v_b, j_b, d_b), total=len(anarci_dict_a)
+        )):
+            seq_a, anarci_label_a, pos_a = self._parse_anarci_dict(aa)
+            vdj_label_a = self._parse_vdj_label(''.join(seq_a), va, da, ja)
+            seq_b, anarci_label_b, pos_b = self._parse_anarci_dict(ab)
+            vdj_label_b = self._parse_vdj_label(''.join(seq_b), vb, db, jb)
+
+            seq_a.append(vocab.CHAIN_BREAK_STR)
+            seq_a.extend(seq_b)
+            anarci_label_a.append(vocab.CHAIN_BREAK_STR)
+            anarci_label_a.extend(anarci_label_b)
+            pos_a.append(0)
+            pos_a.extend(pos_b)
+            vdj_label_a.append(vocab.CHAIN_BREAK_STR)
+            vdj_label_a.extend(vdj_label_b)
+
+            ab = Antibody(
+                sequence=seq_a, 
+                vdj_label=seq_b, 
+                anarci_label=anarci_label_a, 
+                position=pos_a,
+                metadata=self.metadata_dict[meta_idx[i]]
+            )    
+            data.append(ab)
+        self.data = data
+
+    def load_data_folder(self, data_path = None):
+        dataframes = []
+        metadata_dict = {}
+        metadata_idx = 0
+
+        data_path = Path(data_path)
+        files = list(data_path.glob('*.csv.gz'))
+        for filename in tqdm(files):
+            df = pd.read_csv(filename, header=1)
+            metadata = json.loads(','.join(pd.read_csv(filename, nrows=0).columns))
+            df['metadata_idx'] = metadata_idx
+            for k, v in metadata.items():
+                df[k] = v 
+            dataframes.append(df)
+            metadata_dict[metadata_idx] = metadata
+            metadata_idx += 1
+
+        self.df = pd.concat(dataframes, ignore_index=True)
+        self.metadata_dict = metadata_dict
+
+    def to_dataframe(self):
+        return self.df
 
     def to_array(self, aligned=True, save_dir=None):
-        res = self.df.apply(lambda x: self.df_row_to_array_aligned(x, aligned=aligned), axis=1)
+        pass
 
-        if save_dir:
-            save_dir = Path(save_dir)
-            save_dir.mkdir(exist_ok=True, parents=True)
-            res.to_pickle(save_dir / 'oas_arr.pkl')
+    def to_antibody(self, save=True):
+        # 10mins on single thread
+        if self.data is None:
+            self.parse_data()
 
-        return res
-    
-    
+        if save:
+            with open('output/ab.pkl', 'wb') as f:
+                pickle.dump(self.data, f)
+
+        return self.data
+
+    def load_saved(self, path = None):
+        fp = Path(path)
+        with open(fp, 'rb') as f:
+            self.data = pickle.load(f)
         
